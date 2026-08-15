@@ -1,377 +1,265 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session
-from model import CarMaintenancePredictor
-import pandas as pd
-from datetime import datetime, timedelta
 import os
 import uuid
-import json
 import secrets
+from datetime import datetime
+import pandas as pd
+import streamlit as st
 
-app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)  # Generates a secure random 32-character hex string
+# Import your predictor model class
+from model import CarMaintenancePredictor
 
-# Initialize search history list
-search_history = []
+# Set page layout configuration
+st.set_page_config(
+    page_title="Car Maintenance Predictor",
+    page_icon="🚗",
+    layout="wide"
+)
 
-# Initialize predictor and load data
-predictor = CarMaintenancePredictor()
+# ------------------------------------------------------------------------------
+# 1. State Initialization & Predictor Setup
+# ------------------------------------------------------------------------------
+@st.cache_resource
+def get_predictor():
+    """Load or train the model, cached across user sessions."""
+    predictor = CarMaintenancePredictor()
+    if os.path.exists('car_maintenance_model.pkl'):
+        predictor.load_model('car_maintenance_model.pkl')
+    else:
+        vehicles_df, services_df, fuel_logs_df, issues_df = predictor.generate_synthetic_data()
+        features_df = predictor.preprocess_data(vehicles_df, services_df, fuel_logs_df, issues_df)
+        predictor.train_model(features_df)
+        predictor.save_model("car_maintenance_model.pkl")
+    return predictor
 
-# Check if model exists, otherwise train a new one
-if os.path.exists('car_maintenance_model.pkl'):
-    predictor.load_model('car_maintenance_model.pkl')
-    print("Loaded existing model")
-else:
-    # Generate synthetic data
-    print("Generating synthetic data...")
-    vehicles_df, services_df, fuel_logs_df, issues_df = predictor.generate_synthetic_data()
-    
-    # Preprocess data
-    print("Preprocessing data...")
-    features_df = predictor.preprocess_data(vehicles_df, services_df, fuel_logs_df, issues_df)
-    
-    # Train model
-    print("Training model...")
-    predictor.train_model(features_df)
-    
-    # Save model
-    predictor.save_model("car_maintenance_model.pkl")
-    print("Model saved as car_maintenance_model.pkl")
+predictor = get_predictor()
 
-# Store data in memory for demo purposes
-# In a real application, this would be a database
-vehicles_df, services_df, fuel_logs_df, issues_df = predictor.generate_synthetic_data()
+# Initialize dynamic in-memory data tables within Streamlit Session State
+if "data_loaded" not in st.session_state:
+    v_df, s_df, f_df, i_df = predictor.generate_synthetic_data()
+    st.session_state.vehicles = v_df.to_dict('records')
+    st.session_state.services = s_df.to_dict('records')
+    st.session_state.fuel_logs = f_df.to_dict('records') if not f_df.empty else []
+    st.session_state.issues = i_df.to_dict('records') if not i_df.empty else []
+    st.session_state.search_history = []
+    st.session_state.data_loaded = True
 
-# Convert DataFrames to dictionaries for easier access
-vehicles = vehicles_df.to_dict('records')
-services = services_df.to_dict('records')
-fuel_logs = fuel_logs_df.to_dict('records') if not fuel_logs_df.empty else []
-issues = issues_df.to_dict('records') if not issues_df.empty else []
-
-@app.route('/')
-def index():
-    return render_template('landing.html')
-
-@app.route('/dashboard')
-def dashboard():
-    # Get counts for dashboard
-    vehicle_count = len(vehicles)
-    service_count = len(services)
-    maintenance_needed_count = sum(1 for v in vehicles if predict_maintenance_needed(v['vehicle_id']))
-    
-    # Get recent services
-    recent_services = sorted(services, key=lambda x: x['service_date'], reverse=True)[:5]
-    
-    # Get vehicles that need maintenance
-    vehicles_needing_maintenance = []
-    for vehicle in vehicles:
-        if predict_maintenance_needed(vehicle['vehicle_id']):
-            vehicle_with_prediction = vehicle.copy()
-            vehicle_with_prediction['prediction'] = get_prediction(vehicle['vehicle_id'])
-            vehicles_needing_maintenance.append(vehicle_with_prediction)
-    
-    # Limit to top 3
-    vehicles_needing_maintenance = vehicles_needing_maintenance[:3]
-    
-    return render_template('index.html', 
-                          vehicles=vehicles,
-                          vehicle_count=vehicle_count,
-                          service_count=service_count,
-                          maintenance_needed_count=maintenance_needed_count,
-                          recent_services=recent_services,
-                          vehicles_needing_maintenance=vehicles_needing_maintenance)
-
-@app.route('/vehicles')
-def vehicle_list():
-    return render_template('vehicles.html', vehicles=vehicles)
-
-@app.route('/vehicle/<vehicle_id>')
-def vehicle_details(vehicle_id):
-    # Find the vehicle
-    vehicle = next((v for v in vehicles if v['vehicle_id'] == vehicle_id), None)
-    if not vehicle:
-        flash('Vehicle not found', 'danger')
-        return redirect(url_for('index'))
-    
-    # Get services for this vehicle
-    vehicle_services = [s for s in services if s['vehicle_id'] == vehicle_id]
-    vehicle_services.sort(key=lambda x: x['service_date'], reverse=True)
-    
-    # Get fuel logs for this vehicle
-    vehicle_fuel_logs = [f for f in fuel_logs if f['vehicle_id'] == vehicle_id]
-    vehicle_fuel_logs.sort(key=lambda x: x['fuel_date'], reverse=True)
-    
-    # Get issues for this vehicle
-    vehicle_issues = [i for i in issues if i['vehicle_id'] == vehicle_id]
-    vehicle_issues.sort(key=lambda x: x['issue_date'], reverse=True)
-    
-    # Get prediction
-    prediction = get_prediction(vehicle_id)
-    
-    return render_template('vehicle_details.html', 
-                          vehicle=vehicle,
-                          services=vehicle_services,
-                          fuel_logs=vehicle_fuel_logs,
-                          issues=vehicle_issues,
-                          prediction=prediction)
-
-@app.route('/services')
-# Look for any instances where url_for('service_history') is used and change them to url_for('service_list')
-# This might be in your templates or in your route functions
-
-# For example, if you have something like:
-# return redirect(url_for('service_history'))
-# Change it to:
-# return redirect(url_for('service_list'))
-def service_list():
-    return render_template('services.html', services=services, vehicles=vehicles)
-
-@app.route('/add_vehicle', methods=['GET', 'POST'])
-def add_vehicle():
-    if request.method == 'POST':
-        # Generate a new VIN
-        vehicle_id = predictor.generate_vin()
-        
-        # Create new vehicle
-        new_vehicle = {
-            'vehicle_id': vehicle_id,
-            'make': request.form['make'],
-            'model': request.form['model'],
-            'year': int(request.form['year']),
-            'current_mileage': int(request.form['current_mileage']),
-            'fuel_type': request.form['fuel_type'],
-            'engine_type': request.form['engine_type']
-        }
-        
-        # Add to vehicles list
-        vehicles.append(new_vehicle)
-        
-        flash(f'Vehicle {new_vehicle["make"]} {new_vehicle["model"]} added successfully', 'success')
-        return redirect(url_for('vehicle_details', vehicle_id=vehicle_id))
-    
-    return render_template('add_vehicle.html')
-
-@app.route('/add_service/<vehicle_id>', methods=['GET', 'POST'])
-def add_service(vehicle_id):
-    # Find the vehicle
-    vehicle = next((v for v in vehicles if v['vehicle_id'] == vehicle_id), None)
-    if not vehicle:
-        flash('Vehicle not found', 'danger')
-        return redirect(url_for('index'))
-    
-    if request.method == 'POST':
-        # Generate service ID
-        service_id = f"SRV{len(services) + 10001}"
-        
-        # Create new service
-        new_service = {
-            'service_id': service_id,
-            'vehicle_id': vehicle_id,
-            'service_type': request.form['service_type'],
-            'service_date': request.form['service_date'],
-            'service_mileage': int(request.form['service_mileage']),
-            'service_cost': float(request.form['service_cost']),
-            'next_service_mileage': int(request.form['service_mileage']) + 5000  # Simple estimate
-        }
-        
-        # Add to services list
-        services.append(new_service)
-        
-        # Update vehicle mileage if service mileage is higher
-        if new_service['service_mileage'] > vehicle['current_mileage']:
-            vehicle['current_mileage'] = new_service['service_mileage']
-        
-        flash('Service record added successfully', 'success')
-        return redirect(url_for('vehicle_details', vehicle_id=vehicle_id))
-    
-    # Get services for this vehicle
-    vehicle_services = [s for s in services if s['vehicle_id'] == vehicle_id]
-    vehicle_services.sort(key=lambda x: x['service_date'], reverse=True)
-    
-    return render_template('add_service.html', 
-                          vehicle=vehicle, 
-                          services=vehicle_services,
-                          maintenance_types=predictor.maintenance_types[:-1])  # Exclude 'none'
-
-@app.route('/predict', methods=['GET', 'POST'])
-def predict():
-    if request.method == 'POST':
-        vehicle_id = request.form['vehicle_id']
-        make = request.form['make']
-        model = request.form['model']
-        service_id = request.form['service_id']
-        
-        try:
-            # Check if vehicle exists
-            vehicle = next((v for v in vehicles if v['vehicle_id'] == vehicle_id), None)
-            if not vehicle:
-                # Get a list of available vehicle IDs to help the user
-                available_vehicles = [{'id': v['vehicle_id'], 'make': v['make'], 'model': v['model']} 
-                                     for v in vehicles[:5]]  # Show first 5 for brevity
-                flash(f'Vehicle with VIN {vehicle_id} not found. Available vehicles: ' + 
-                      ', '.join([f"{v['id']} ({v['make']} {v['model']})" for v in available_vehicles]), 'warning')
-                return redirect(url_for('predict'))
-                
-            # Check if service exists
-            service = next((s for s in services if s['service_id'] == service_id), None)
-            if not service:
-                # Get a list of available service IDs for this vehicle
-                available_services = [s['service_id'] for s in services 
-                                     if s['vehicle_id'] == vehicle_id][:5]  # Show first 5
-                if available_services:
-                    flash(f'Service ID {service_id} not found. Available service IDs for this vehicle: ' + 
-                          ', '.join(available_services), 'warning')
-                else:
-                    flash(f'No services found for vehicle {vehicle_id}', 'warning')
-                return redirect(url_for('predict'))
-            
-            # Convert DataFrames for prediction
-            vehicles_df = pd.DataFrame(vehicles)
-            services_df = pd.DataFrame(services)
-            fuel_logs_df = pd.DataFrame(fuel_logs) if fuel_logs else pd.DataFrame()
-            issues_df = pd.DataFrame(issues) if issues else pd.DataFrame()
-            
-            result = predictor.predict_from_ids(
-                vehicle_id, make, model, service_id,
-                vehicles_df, services_df, fuel_logs_df, issues_df
-            )
-            
-            # Save search history if user is logged in
-            if 'user_id' in session:
-                search_id = str(uuid.uuid4())
-                search_record = {
-                    'search_id': search_id,
-                    'user_id': session['user_id'],
-                    'vehicle_id': vehicle_id,
-                    'make': make,
-                    'model': model,
-                    'service_id': service_id,
-                    'search_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'prediction_result': result
-                }
-                search_history.append(search_record)
-            
-            return render_template('prediction_result.html', result=result)
-            
-        except Exception as e:
-            flash(f'Error making prediction: {str(e)}', 'danger')
-            return redirect(url_for('predict'))
-    
-    # Get sample vehicle and service for demonstration
-    sample_vehicle = vehicles[0]
-    sample_service = next((s for s in services if s['vehicle_id'] == sample_vehicle['vehicle_id']), None)
-    
-    # Get a few sample vehicles and their services to display to the user
-    sample_data = []
-    for v in vehicles[:5]:  # Get first 5 vehicles
-        v_services = [s for s in services if s['vehicle_id'] == v['vehicle_id']]
-        if v_services:
-            sample_data.append({
-                'vehicle_id': v['vehicle_id'],
-                'make': v['make'],
-                'model': v['model'],
-                'service_id': v_services[0]['service_id']
-            })
-    
-    return render_template('predict.html', 
-                          vehicles=vehicles, 
-                          services=services,
-                          sample_vehicle=sample_vehicle,
-                          sample_service=sample_service,
-                          sample_data=sample_data)
-
-# Helper functions
+# Helper Functions
 def predict_maintenance_needed(vehicle_id):
-    """Quick check if maintenance is needed for dashboard"""
-    # Find the vehicle
-    vehicle = next((v for v in vehicles if v['vehicle_id'] == vehicle_id), None)
+    vehicle = next((v for v in st.session_state.vehicles if v['vehicle_id'] == vehicle_id), None)
     if not vehicle:
         return False
     
-    # Find the most recent service
-    vehicle_services = [s for s in services if s['vehicle_id'] == vehicle_id]
+    vehicle_services = [s for s in st.session_state.services if s['vehicle_id'] == vehicle_id]
     if not vehicle_services:
-        return True  # No services means maintenance is needed
+        return True
     
-    # Sort by date (newest first)
-    vehicle_services.sort(key=lambda x: x['service_date'], reverse=True)
-    last_service = vehicle_services[0]
-    
-    # Simple rule-based logic for quick check
-    days_since_last_service = (datetime.now() - datetime.strptime(last_service['service_date'], '%Y-%m-%d')).days
-    mileage_since_last_service = vehicle['current_mileage'] - last_service['service_mileage']
-    
-    # If it's been more than 6 months or 7500 miles, maintenance is needed
-    return days_since_last_service > 180 or mileage_since_last_service > 7500
-
-def get_prediction(vehicle_id):
-    """Get full prediction for a vehicle"""
-    # Find the vehicle
-    vehicle = next((v for v in vehicles if v['vehicle_id'] == vehicle_id), None)
-    if not vehicle:
-        return None
-    
-    # Find the most recent service
-    vehicle_services = [s for s in services if s['vehicle_id'] == vehicle_id]
-    if not vehicle_services:
-        return None  # Can't predict without service history
-    
-    # Sort by date (newest first)
-    vehicle_services.sort(key=lambda x: x['service_date'], reverse=True)
+    vehicle_services.sort(key=lambda x: str(x['service_date']), reverse=True)
     last_service = vehicle_services[0]
     
     try:
-        # Convert DataFrames for prediction
-        vehicles_df = pd.DataFrame(vehicles)
-        services_df = pd.DataFrame(services)
-        fuel_logs_df = pd.DataFrame(fuel_logs) if fuel_logs else pd.DataFrame()
-        issues_df = pd.DataFrame(issues) if issues else pd.DataFrame()
+        s_date = datetime.strptime(str(last_service['service_date']), '%Y-%m-%d')
+    except ValueError:
+        s_date = datetime.now()
         
-        result = predictor.predict_from_ids(
+    days_since = (datetime.now() - s_date).days
+    mileage_since = vehicle['current_mileage'] - last_service['service_mileage']
+    
+    return days_since > 180 or mileage_since > 7500
+
+def get_prediction(vehicle_id):
+    vehicle = next((v for v in st.session_state.vehicles if v['vehicle_id'] == vehicle_id), None)
+    if not vehicle:
+        return None
+    
+    vehicle_services = [s for s in st.session_state.services if s['vehicle_id'] == vehicle_id]
+    if not vehicle_services:
+        return None
+    
+    vehicle_services.sort(key=lambda x: str(x['service_date']), reverse=True)
+    last_service = vehicle_services[0]
+    
+    try:
+        v_df = pd.DataFrame(st.session_state.vehicles)
+        s_df = pd.DataFrame(st.session_state.services)
+        f_df = pd.DataFrame(st.session_state.fuel_logs) if st.session_state.fuel_logs else pd.DataFrame()
+        i_df = pd.DataFrame(st.session_state.issues) if st.session_state.issues else pd.DataFrame()
+        
+        return predictor.predict_from_ids(
             vehicle_id, vehicle['make'], vehicle['model'], last_service['service_id'],
-            vehicles_df, services_df, fuel_logs_df, issues_df
+            v_df, s_df, f_df, i_df
         )
-        
-        return result
-        
     except Exception as e:
-        print(f"Error predicting for vehicle {vehicle_id}: {str(e)}")
+        st.error(f"Error making prediction: {e}")
         return None
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
-        
-        # In a real application, you would validate against a database
-        # For now, we'll just redirect to the dashboard
-        flash('Login successful!', 'success')
-        return redirect(url_for('dashboard'))
+# ------------------------------------------------------------------------------
+# 2. Navigation Sidebar
+# ------------------------------------------------------------------------------
+st.sidebar.title("Navigation")
+menu = st.sidebar.radio(
+    "Go to",
+    ["Dashboard", "Vehicles", "Services", "Predict Maintenance", "Add Vehicle", "Add Service"]
+)
+
+# ------------------------------------------------------------------------------
+# 3. View: Dashboard
+# ------------------------------------------------------------------------------
+if menu == "Dashboard":
+    st.title("🚗 Car Maintenance Predictor Dashboard")
+    st.markdown("---")
     
-    return render_template('login.html')
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        name = request.form['name']
-        email = request.form['email']
-        password = request.form['password']
-        
-        # In a real application, you would save to a database
-        flash('Account created successfully!', 'success')
-        return redirect(url_for('dashboard'))
+    col1, col2, col3 = st.columns(3)
+    vehicle_count = len(st.session_state.vehicles)
+    service_count = len(st.session_state.services)
+    maint_count = sum(1 for v in st.session_state.vehicles if predict_maintenance_needed(v['vehicle_id']))
     
-    return render_template('signup.html')
+    col1.metric("Total Vehicles", vehicle_count)
+    col2.metric("Total Services", service_count)
+    col3.metric("Maintenance Needed", maint_count)
+    
+    st.subheader("Vehicles Needing Maintenance")
+    needing_maint = []
+    for v in st.session_state.vehicles:
+        if predict_maintenance_needed(v['vehicle_id']):
+            v_info = v.copy()
+            v_info['Prediction'] = get_prediction(v['vehicle_id'])
+            needing_maint.append(v_info)
+    
+    if needing_maint:
+        st.table(pd.DataFrame(needing_maint[:3]))
+    else:
+        st.info("No vehicles currently require immediate maintenance.")
 
-@app.route('/google_login')
-def google_login():
-    # This would normally use OAuth with Google
-    flash('Logged in with Google successfully!', 'success')
-    return redirect(url_for('dashboard'))
+    st.subheader("Recent Services")
+    recent = sorted(st.session_state.services, key=lambda x: str(x['service_date']), reverse=True)[:5]
+    st.dataframe(pd.DataFrame(recent), use_container_width=True)
 
-@app.route('/forgot_password')
-def forgot_password():
-    return render_template('forgot_password.html')
+# ------------------------------------------------------------------------------
+# 4. View: Vehicles
+# ------------------------------------------------------------------------------
+elif menu == "Vehicles":
+    st.title("📋 Vehicle List & Details")
+    v_df = pd.DataFrame(st.session_state.vehicles)
+    st.dataframe(v_df, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("Inspect Specific Vehicle")
+    selected_id = st.selectbox("Select VIN", v_df['vehicle_id'].unique() if not v_df.empty else [])
+    
+    if selected_id:
+        vehicle = next((v for v in st.session_state.vehicles if v['vehicle_id'] == selected_id), None)
+        if vehicle:
+            st.write(f"**Make/Model:** {vehicle['make']} {vehicle['model']} ({vehicle['year']})")
+            st.write(f"**Current Mileage:** {vehicle['current_mileage']} miles")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Service History")
+                v_services = [s for s in st.session_state.services if s['vehicle_id'] == selected_id]
+                st.dataframe(pd.DataFrame(v_services), use_container_width=True)
+            with c2:
+                st.subheader("Fuel Logs")
+                v_fuels = [f for f in st.session_state.fuel_logs if f['vehicle_id'] == selected_id]
+                st.dataframe(pd.DataFrame(v_fuels), use_container_width=True)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# ------------------------------------------------------------------------------
+# 5. View: Services
+# ------------------------------------------------------------------------------
+elif menu == "Services":
+    st.title("🛠 Service Records")
+    st.dataframe(pd.DataFrame(st.session_state.services), use_container_width=True)
+
+# ------------------------------------------------------------------------------
+# 6. View: Predict Maintenance
+# ------------------------------------------------------------------------------
+elif menu == "Predict Maintenance":
+    st.title("🔮 Maintenance Prediction")
+    
+    v_ids = [v['vehicle_id'] for v in st.session_state.vehicles]
+    selected_v_id = st.selectbox("Vehicle VIN", v_ids)
+    
+    if selected_v_id:
+        vehicle = next(v for v in st.session_state.vehicles if v['vehicle_id'] == selected_v_id)
+        rel_services = [s['service_id'] for s in st.session_state.services if s['vehicle_id'] == selected_v_id]
+        
+        if rel_services:
+            selected_s_id = st.selectbox("Service ID", rel_services)
+            
+            if st.button("Predict Maintenance Need"):
+                result = get_prediction(selected_v_id)
+                if result is not None:
+                    st.success("Prediction generated successfully!")
+                    st.write("### Result Output:")
+                    st.json(result if isinstance(result, (dict, list)) else {"prediction": str(result)})
+                else:
+                    st.warning("Could not calculate prediction for selected IDs.")
+        else:
+            st.warning("No service records found for the selected vehicle.")
+
+# ------------------------------------------------------------------------------
+# 7. View: Add Vehicle
+# ------------------------------------------------------------------------------
+elif menu == "Add Vehicle":
+    st.title("➕ Add New Vehicle")
+    
+    with st.form("add_vehicle_form"):
+        make = st.text_input("Make", value="Toyota")
+        model = st.text_input("Model", value="Camry")
+        year = st.number_input("Year", min_value=1990, max_value=2026, value=2020)
+        mileage = st.number_input("Current Mileage", min_value=0, value=45000)
+        fuel_type = st.selectbox("Fuel Type", ["Gasoline", "Diesel", "Hybrid", "Electric"])
+        engine_type = st.selectbox("Engine Type", ["V6", "I4", "V8", "Electric"])
+        
+        submitted = st.form_submit_button("Add Vehicle")
+        if submitted:
+            v_id = predictor.generate_vin() if hasattr(predictor, 'generate_vin') else f"VIN{secrets.token_hex(4).upper()}"
+            new_vehicle = {
+                'vehicle_id': v_id,
+                'make': make,
+                'model': model,
+                'year': int(year),
+                'current_mileage': int(mileage),
+                'fuel_type': fuel_type,
+                'engine_type': engine_type
+            }
+            st.session_state.vehicles.append(new_vehicle)
+            st.success(f"Successfully added vehicle {make} {model} (ID: {v_id})!")
+
+# ------------------------------------------------------------------------------
+# 8. View: Add Service
+# ------------------------------------------------------------------------------
+elif menu == "Add Service":
+    st.title("➕ Add Service Record")
+    
+    v_ids = [v['vehicle_id'] for v in st.session_state.vehicles]
+    
+    if not v_ids:
+        st.warning("Please add a vehicle first.")
+    else:
+        with st.form("add_service_form"):
+            v_id = st.selectbox("Select Vehicle", v_ids)
+            service_type = st.text_input("Service Type", value="Oil Change")
+            service_date = st.date_input("Service Date")
+            service_mileage = st.number_input("Mileage at Service", min_value=0, value=50000)
+            service_cost = st.number_input("Service Cost ($)", min_value=0.0, value=120.00)
+            
+            submitted = st.form_submit_button("Add Service Record")
+            if submitted:
+                s_id = f"SRV{len(st.session_state.services) + 10001}"
+                new_service = {
+                    'service_id': s_id,
+                    'vehicle_id': v_id,
+                    'service_type': service_type,
+                    'service_date': str(service_date),
+                    'service_mileage': int(service_mileage),
+                    'service_cost': float(service_cost),
+                    'next_service_mileage': int(service_mileage) + 5000
+                }
+                st.session_state.services.append(new_service)
+                
+                # Update vehicle mileage if higher
+                vehicle = next(v for v in st.session_state.vehicles if v['vehicle_id'] == v_id)
+                if int(service_mileage) > vehicle['current_mileage']:
+                    vehicle['current_mileage'] = int(service_mileage)
+                    
+                st.success(f"Added service record {s_id} for Vehicle {v_id}!")
