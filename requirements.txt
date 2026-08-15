@@ -1,6 +1,4 @@
-flask>=2.0.1
-pandas>=1.5.0
-numpy>=1.24.0
-scikit-learn>=1.0
-joblib>=1.1.0
-matplotlib>=3.4.3
+streamlit
+pandas
+scikit-learn
+joblib
